@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 
@@ -38,8 +39,12 @@ func main() {
 
 	rp := capi.NewProxy(signer, s3Endpoint)
 
+	mux := http.NewServeMux()
+	mux.Handle("/", rp)
+	mux.HandleFunc("/_debug", capi.DebugHandler(rp.Director))
+
 	n := negroni.Classic()
-	n.UseHandler(rp)
+	n.UseHandler(mux)
 
 	ridge.Run(":8080", "/", n)
 }
