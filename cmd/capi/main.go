@@ -13,6 +13,7 @@ import (
 	"github.com/fujiwara/ridge"
 	"github.com/nabeken/capi"
 	"github.com/nabeken/go-jwkset"
+	"github.com/pmylund/go-cache"
 	"github.com/rs/zerolog"
 	"github.com/urfave/negroni"
 	"gopkg.in/square/go-jose.v2"
@@ -53,6 +54,12 @@ func main() {
 		JWKFetcher: cacher,
 	}
 
+	authorizer := &capi.Authorizer{
+		S3Endpoint: s3Endpoint,
+		Signer:     signer,
+		Cache:      cache.New(time.Minute, time.Minute),
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/", rp)
 	mux.HandleFunc("/_debug", capi.DebugHandler(rp.Director))
@@ -69,6 +76,8 @@ func main() {
 
 	n.Use(authenticator)
 	n.UseFunc(authenticator.WithSub)
+	n.Use(authorizer)
+
 	n.UseHandler(mux)
 
 	ridge.Run(":8080", "/", n)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -13,7 +14,9 @@ import (
 
 	v4signer "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/nabeken/go-jwkset"
+	"github.com/pmylund/go-cache"
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/hlog"
 	"github.com/urfave/negroni"
 	"gopkg.in/square/go-jose.v2"
 )
@@ -29,7 +32,10 @@ func (s *Signer) Sign(req *http.Request, signTime time.Time) error {
 	return err
 }
 
-const indexDocument = "index.html"
+const (
+	indexDocument  = "index.html"
+	policyDocument = "capiaccess.txt"
+)
 
 // https://docs.aws.amazon.com/elasticloadbalancing/latest/application/listener-authenticate-users.html
 type ALBOIDCClaimSet struct {
@@ -49,6 +55,79 @@ type capiHTTPContext int
 const (
 	ctxClaimSet capiHTTPContext = 1
 )
+
+type Authorizer struct {
+	S3Endpoint *url.URL
+	Signer     *Signer
+	Cache      *cache.Cache
+}
+
+func (a *Authorizer) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
+	log := hlog.FromRequest(req).With().Str("s3_endpoint", a.S3Endpoint.String()).Logger()
+	policy, err := a.lookupPolicy()
+	if err != nil {
+		log.Info().Err(err).Msg("failed to lookup policy")
+		http.Error(rw, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	claim := FromALBOIDCClaimSetContext(req.Context())
+	for _, pol := range policy {
+		if Authorize(claim.Email, pol) {
+			next(rw, req)
+			return
+		}
+	}
+
+	http.Error(rw, "Unauthorized", http.StatusUnauthorized)
+}
+
+func (a *Authorizer) lookupPolicy() ([]string, error) {
+	if policy, found := a.Cache.Get(a.S3Endpoint.String()); found {
+		return policy.([]string), nil
+	}
+
+	policy, err := a.fetchPolicy()
+	if err != nil {
+		return nil, fmt.Errorf("fetching policy: %w", err)
+	}
+
+	a.Cache.Set(a.S3Endpoint.String(), policy, cache.DefaultExpiration)
+	return policy, nil
+}
+
+func (a *Authorizer) fetchPolicy() ([]string, error) {
+	policyURL, err := a.S3Endpoint.Parse("/" + policyDocument)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, policyURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := a.Signer.Sign(req, time.Now()); err != nil {
+		panic(err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("reading policy: %s", resp.Status)
+	}
+
+	lines, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading policy: %w", err)
+	}
+
+	return strings.Split(string(lines), "\n"), nil
+}
 
 type Authenticator struct {
 	JWKFetcher jwkset.Fetcher
@@ -167,7 +246,11 @@ type Logger struct {
 func (l *Logger) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
 	start := time.Now()
 
-	rl := l.L.With().Logger()
+	rl := l.L.With().
+		Str("hostname", req.Host).
+		Str("method", req.Method).
+		Str("path", req.URL.Path).Logger()
+
 	req = req.WithContext(rl.WithContext(req.Context()))
 
 	next(rw, req)
@@ -177,8 +260,5 @@ func (l *Logger) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.
 	rl.Info().
 		Int("status", res.Status()).
 		Dur("duration", time.Since(start)).
-		Str("hostname", req.Host).
-		Str("method", req.Method).
-		Str("path", req.URL.Path).
-		Msg("")
+		Msg("completed.")
 }
