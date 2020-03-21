@@ -13,6 +13,8 @@ import (
 
 	v4signer "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/nabeken/go-jwkset"
+	"github.com/rs/zerolog"
+	"github.com/urfave/negroni"
 	"gopkg.in/square/go-jose.v2"
 )
 
@@ -61,6 +63,15 @@ func (a *Authenticator) ServeHTTP(rw http.ResponseWriter, req *http.Request, nex
 	}
 
 	req = req.WithContext(context.WithValue(req.Context(), ctxClaimSet, claim))
+	next(rw, req)
+}
+
+func (a *Authenticator) WithSub(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
+	log := zerolog.Ctx(req.Context())
+	claim := FromALBOIDCClaimSetContext(req.Context())
+	log.UpdateContext(func(c zerolog.Context) zerolog.Context {
+		return c.Str("sub", claim.Sub)
+	})
 	next(rw, req)
 }
 
@@ -147,4 +158,27 @@ func DebugHandler(dir func(*http.Request)) http.HandlerFunc {
 		fmt.Fprintf(rw, "%#v\n", req.URL)
 		fmt.Fprintf(rw, "%#v\n", claim)
 	}
+}
+
+type Logger struct {
+	L zerolog.Logger
+}
+
+func (l *Logger) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
+	start := time.Now()
+
+	rl := l.L.With().Logger()
+	req = req.WithContext(rl.WithContext(req.Context()))
+
+	next(rw, req)
+
+	res := rw.(negroni.ResponseWriter)
+
+	rl.Info().
+		Int("status", res.Status()).
+		Dur("duration", time.Since(start)).
+		Str("hostname", req.Host).
+		Str("method", req.Method).
+		Str("path", req.URL.Path).
+		Msg("")
 }

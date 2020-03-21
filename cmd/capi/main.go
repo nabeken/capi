@@ -13,6 +13,7 @@ import (
 	"github.com/fujiwara/ridge"
 	"github.com/nabeken/capi"
 	"github.com/nabeken/go-jwkset"
+	"github.com/rs/zerolog"
 	"github.com/urfave/negroni"
 	"gopkg.in/square/go-jose.v2"
 )
@@ -56,8 +57,18 @@ func main() {
 	mux.Handle("/", rp)
 	mux.HandleFunc("/_debug", capi.DebugHandler(rp.Director))
 
-	n := negroni.Classic()
+	log := zerolog.New(os.Stdout).With().
+		Timestamp().
+		Str("app", "capi").
+		Logger()
+
+	n := negroni.New(
+		negroni.NewRecovery(),
+		&capi.Logger{L: log},
+	)
+
 	n.Use(authenticator)
+	n.UseFunc(authenticator.WithSub)
 	n.UseHandler(mux)
 
 	ridge.Run(":8080", "/", n)
