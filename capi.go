@@ -3,6 +3,7 @@ package capi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -44,6 +45,8 @@ type ALBOIDCClaimSet struct {
 	Email string `json:"email"`
 	Exp   int64  `json:"exp"`
 }
+
+var jwtExpSkew = time.Minute
 
 func FromALBOIDCClaimSetContext(ctx context.Context) ALBOIDCClaimSet {
 	v, _ := ctx.Value(ctxClaimSet).(ALBOIDCClaimSet)
@@ -192,7 +195,17 @@ func (a *Authenticator) verifyJWT(data string) (ALBOIDCClaimSet, error) {
 		return ALBOIDCClaimSet{}, fmt.Errorf("decoding: %w", err)
 	}
 
+	if !verifyExp(time.Now(), jwtExpSkew, claim.Exp) {
+		return ALBOIDCClaimSet{}, errors.New("exp expired")
+	}
+
 	return claim, nil
+}
+
+func verifyExp(now time.Time, skew time.Duration, exp int64) bool {
+	expT := time.Unix(exp, 0)
+	skewT := expT.Add(skew)
+	return now.Before(skewT)
 }
 
 func Director(signer *Signer, s3Endpoint *url.URL) func(*http.Request) {
