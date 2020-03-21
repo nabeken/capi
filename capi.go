@@ -58,6 +58,7 @@ func NewProxy(signer *Signer, s3Endpoint *url.URL) *httputil.ReverseProxy {
 func DebugHandler(dir func(*http.Request)) http.HandlerFunc {
 	return func(rw http.ResponseWriter, req *http.Request) {
 		dir(req)
+		rw.Header().Set("Content-Type", "text/plain")
 		fmt.Fprintf(rw, "%#v\n", req)
 		fmt.Fprintf(rw, "%#v\n", req.URL)
 	}
