@@ -36,6 +36,7 @@ func Director(signer *Signer, s3Endpoint *url.URL) func(*http.Request) {
 		req.Header.Del("x-forwarded-for")
 		req.Header.Del("x-forwarded-port")
 		req.Header.Del("x-forwarded-proto")
+		req.Header.Del("connection")
 
 		// simulate index document
 		if strings.HasSuffix(req.URL.Path, "/") {
