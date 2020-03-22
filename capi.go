@@ -6,16 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"strings"
 	"time"
 
 	v4signer "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/nabeken/go-jwkset"
-	"github.com/pmylund/go-cache"
+	"github.com/patrickmn/go-cache"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 	"github.com/urfave/negroni"
@@ -23,13 +21,12 @@ import (
 )
 
 type Signer struct {
-	Region string
 	Signer *v4signer.Signer
 }
 
-func (s *Signer) Sign(req *http.Request, signTime time.Time) error {
+func (s *Signer) Sign(req *http.Request, signRegion string, signTime time.Time) error {
 	// Only GET and HEAD supported
-	_, err := s.Signer.Sign(req, nil, "s3", s.Region, signTime)
+	_, err := s.Signer.Sign(req, nil, "s3", signRegion, signTime)
 	return err
 }
 
@@ -53,21 +50,27 @@ func FromALBOIDCClaimSetContext(ctx context.Context) ALBOIDCClaimSet {
 	return v
 }
 
+func FromS3EndpointJWT(ctx context.Context) S3EndpointJWT {
+	v, _ := ctx.Value(ctxS3EndpointJWT).(S3EndpointJWT)
+	return v
+}
+
 type capiHTTPContext int
 
 const (
-	ctxClaimSet capiHTTPContext = 1
+	ctxClaimSet capiHTTPContext = iota
+	ctxS3EndpointJWT
 )
 
 type Authorizer struct {
-	S3Endpoint *url.URL
-	Signer     *Signer
-	Cache      *cache.Cache
+	Signer *Signer
+	Cache  *cache.Cache
 }
 
 func (a *Authorizer) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
-	log := hlog.FromRequest(req).With().Str("s3_endpoint", a.S3Endpoint.String()).Logger()
-	policy, err := a.lookupPolicy()
+	s3Endpoint := FromS3EndpointJWT(req.Context())
+	log := hlog.FromRequest(req).With().Str("s3_endpoint", s3Endpoint.URL().String()).Logger()
+	policy, err := a.lookupPolicy(s3Endpoint)
 	if err != nil {
 		log.Info().Err(err).Msg("failed to lookup policy")
 		http.Error(rw, "Unauthorized", http.StatusUnauthorized)
@@ -85,22 +88,22 @@ func (a *Authorizer) ServeHTTP(rw http.ResponseWriter, req *http.Request, next h
 	http.Error(rw, "Unauthorized", http.StatusUnauthorized)
 }
 
-func (a *Authorizer) lookupPolicy() ([]string, error) {
-	if policy, found := a.Cache.Get(a.S3Endpoint.String()); found {
+func (a *Authorizer) lookupPolicy(s3Endpoint S3EndpointJWT) ([]string, error) {
+	if policy, found := a.Cache.Get(s3Endpoint.URL().String()); found {
 		return policy.([]string), nil
 	}
 
-	policy, err := a.fetchPolicy()
+	policy, err := a.fetchPolicy(s3Endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("fetching policy: %w", err)
 	}
 
-	a.Cache.Set(a.S3Endpoint.String(), policy, cache.DefaultExpiration)
+	a.Cache.Set(s3Endpoint.URL().String(), policy, cache.DefaultExpiration)
 	return policy, nil
 }
 
-func (a *Authorizer) fetchPolicy() ([]string, error) {
-	policyURL, err := a.S3Endpoint.Parse("/" + policyDocument)
+func (a *Authorizer) fetchPolicy(s3Endpoint S3EndpointJWT) ([]string, error) {
+	policyURL, err := s3Endpoint.URL().Parse("/" + policyDocument)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +113,7 @@ func (a *Authorizer) fetchPolicy() ([]string, error) {
 		return nil, err
 	}
 
-	if err := a.Signer.Sign(req, time.Now()); err != nil {
+	if err := a.Signer.Sign(req, s3Endpoint.Region, time.Now()); err != nil {
 		panic(err)
 	}
 
@@ -139,7 +142,7 @@ type Authenticator struct {
 func (a *Authenticator) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
 	claim, err := a.verifyJWT(req.Header.Get("x-amzn-oidc-data"))
 	if err != nil {
-		log.Printf("unable to verify: %s", err)
+		hlog.FromRequest(req).Info().Err(err).Msg("unable to verify JWT")
 		http.Error(rw, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -148,7 +151,7 @@ func (a *Authenticator) ServeHTTP(rw http.ResponseWriter, req *http.Request, nex
 	next(rw, req)
 }
 
-func (a *Authenticator) WithSub(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
+func (a *Authenticator) LogWithSub(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
 	log := zerolog.Ctx(req.Context())
 	claim := FromALBOIDCClaimSetContext(req.Context())
 	log.UpdateContext(func(c zerolog.Context) zerolog.Context {
@@ -208,34 +211,33 @@ func verifyExp(now time.Time, skew time.Duration, exp int64) bool {
 	return now.Before(skewT)
 }
 
-func Director(signer *Signer, s3Endpoint *url.URL) func(*http.Request) {
-	return func(req *http.Request) {
-		req.Host = s3Endpoint.Host
-		req.URL.Scheme = s3Endpoint.Scheme
-		req.URL.Host = s3Endpoint.Host
-
-		// when we proxy to S3, we have to exclude the following headers
-		// since after the signer signs it, the proxy handler alters it.
-
-		req.Header.Del("x-forwarded-for")
-		req.Header.Del("x-forwarded-port")
-		req.Header.Del("x-forwarded-proto")
-		req.Header.Del("connection")
-
-		// simulate index document
-		if strings.HasSuffix(req.URL.Path, "/") {
-			req.URL.Path = req.URL.Path + indexDocument
-		}
-
-		if err := signer.Sign(req, time.Now()); err != nil {
-			panic(err)
-		}
-	}
-}
-
-func NewProxy(signer *Signer, s3Endpoint *url.URL) *httputil.ReverseProxy {
+func NewProxy(signer *Signer) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
-		Director: Director(signer, s3Endpoint),
+		Director: func(req *http.Request) {
+			s3Endpoint := FromS3EndpointJWT(req.Context())
+
+			s3url := s3Endpoint.URL()
+			req.Host = s3url.Host
+			req.URL.Scheme = s3url.Scheme
+			req.URL.Host = s3url.Host
+
+			// when we proxy to S3, we have to exclude the following headers
+			// since after the signer signs it, the proxy handler alters it.
+
+			req.Header.Del("x-forwarded-for")
+			req.Header.Del("x-forwarded-port")
+			req.Header.Del("x-forwarded-proto")
+			req.Header.Del("connection")
+
+			// simulate index document
+			if strings.HasSuffix(req.URL.Path, "/") {
+				req.URL.Path = req.URL.Path + indexDocument
+			}
+
+			if err := signer.Sign(req, s3Endpoint.Region, time.Now()); err != nil {
+				panic(err)
+			}
+		},
 	}
 }
 

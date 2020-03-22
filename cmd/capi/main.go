@@ -1,48 +1,50 @@
 package main
 
 import (
-	"fmt"
-	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/session"
 	v4signer "github.com/aws/aws-sdk-go/aws/signer/v4"
+	"github.com/aws/aws-sdk-go/service/secretsmanager"
 	"github.com/fujiwara/ridge"
 	"github.com/nabeken/capi"
 	"github.com/nabeken/go-jwkset"
-	"github.com/pmylund/go-cache"
+	"github.com/patrickmn/go-cache"
 	"github.com/rs/zerolog"
 	"github.com/urfave/negroni"
 	"gopkg.in/square/go-jose.v2"
 )
 
 func main() {
+	log := zerolog.New(os.Stdout).With().
+		Timestamp().
+		Str("app", "capi").
+		Logger()
+
 	region := os.Getenv("AWS_REGION")
 	if region == "" {
-		log.Fatal("Please set AWS_REGION environment variable.")
+		log.Fatal().Msg("Please set AWS_REGION environment variable.")
 	}
 
-	s3Bucket := os.Getenv("CAPI_S3_BUCKET")
-	if s3Bucket == "" {
-		log.Fatal("Please set CAPI_S3_BUCKET environment variable.")
+	dnsSigningKeyPath := os.Getenv("CAPI_DNS_SIGNING_KEY_PATH")
+	if dnsSigningKeyPath == "" {
+		log.Fatal().Msg("Please set CAPI_DNS_SIGNING_KEY_PATH environment variable.")
 	}
 
-	s3Endpoint, err := url.Parse(
-		fmt.Sprintf("https://%s.s3-%s.amazonaws.com", s3Bucket, region),
-	)
+	sess := session.Must(session.NewSession())
+
+	dnsSigningKey, err := capi.GetDNSSigningKey(secretsmanager.New(sess), dnsSigningKeyPath)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal().Err(err).Msg("failed to load the DNS signing key")
 	}
 
 	signer := &capi.Signer{
-		Region: region,
-		Signer: v4signer.NewSigner(session.Must(session.NewSession()).Config.Credentials),
+		Signer: v4signer.NewSigner(sess.Config.Credentials),
 	}
 
-	rp := capi.NewProxy(signer, s3Endpoint)
+	rp := capi.NewProxy(signer)
 
 	cacher := jwkset.NewCacher(10*time.Minute, time.Minute, &jwkset.ALBFetcher{
 		Client: &http.Client{},
@@ -55,29 +57,33 @@ func main() {
 	}
 
 	authorizer := &capi.Authorizer{
-		S3Endpoint: s3Endpoint,
-		Signer:     signer,
-		Cache:      cache.New(time.Minute, time.Minute),
+		Signer: signer,
+		Cache:  cache.New(time.Minute, time.Minute),
 	}
 
-	mux := http.NewServeMux()
-	mux.Handle("/", rp)
-	mux.HandleFunc("/_debug", capi.DebugHandler(rp.Director))
-
-	log := zerolog.New(os.Stdout).With().
-		Timestamp().
-		Str("app", "capi").
-		Logger()
+	s3EndpointResolver := &capi.DNSS3EndpointResolver{
+		Cache: cache.New(time.Minute, time.Minute),
+		JWK:   dnsSigningKey,
+	}
 
 	n := negroni.New(
 		negroni.NewRecovery(),
 		&capi.Logger{L: log},
 	)
 
+	// check the requested host configures the DNS record to establish a S3 bucket mapping
+	n.Use(s3EndpointResolver)
+
+	// check the ALB-signed JWT
 	n.Use(authenticator)
-	n.UseFunc(authenticator.WithSub)
+	n.UseFunc(authenticator.LogWithSub)
+
+	// check ACL in the requested S3 bucket
 	n.Use(authorizer)
 
+	mux := http.NewServeMux()
+	mux.Handle("/", rp)
+	mux.HandleFunc("/_debug", capi.DebugHandler(rp.Director))
 	n.UseHandler(mux)
 
 	ridge.Run(":8080", "/", n)
