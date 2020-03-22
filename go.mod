@@ -4,12 +4,10 @@ go 1.13
 
 require github.com/aws/aws-sdk-go v1.29.29
 
-replace github.com/nabeken/go-jwkset => /Users/nabeken/go/src/github.com/nabeken/go-jwkset
-
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/fujiwara/ridge v0.1.0
-	github.com/nabeken/go-jwkset v0.1.1
+	github.com/nabeken/go-jwkset v0.1.2
 	github.com/pmylund/go-cache v2.1.0+incompatible
 	github.com/rs/zerolog v1.18.0
 	github.com/stretchr/testify v1.5.1

@@ -20,6 +20,8 @@ github.com/jmespath/go-jmespath v0.0.0-20180206201540-c2b33e8439af h1:pmfjZENx5i
 github.com/jmespath/go-jmespath v0.0.0-20180206201540-c2b33e8439af/go.mod h1:Nht3zPeWKUH0NzdCt2Blrr5ys8VGpn0CEB0cQHVjt7k=
 github.com/kayac/parallel-benchmark v0.0.0-20151202131136-8767c01bdc44/go.mod h1:dA/GP0Wp2oE0DEhLk0jZsrtUPkt8QuivH3o7GduayIA=
 github.com/mash/go-accesslog v1.1.0/go.mod h1:DAbGQzio0KX16krP/3uouoTPxGbzcPjFAb948zazOgg=
+github.com/nabeken/go-jwkset v0.1.2 h1:xVbEomiAox1YK8cZjYgCyX272/zwBRbEB8BGXQXGhyg=
+github.com/nabeken/go-jwkset v0.1.2/go.mod h1:uDFybIjbB+uzmheMj4CfcvDnJdbWzAzdcZg886WRyBw=
 github.com/patrickmn/go-cache v2.1.0+incompatible h1:HRMgzkcYKYpi3C8ajMPV8OFXaaRUnok+kx1WdO15EQc=
 github.com/patrickmn/go-cache v2.1.0+incompatible/go.mod h1:3Qf8kWWT7OJRJbdiICTKqZju1ZixQ/KpMGzzAfe6+WQ=
 github.com/pkg/errors v0.8.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
