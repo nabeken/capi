@@ -8,11 +8,13 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"strings"
 	"time"
 
 	v4signer "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/nabeken/go-jwkset"
+	"github.com/nabeken/psadm"
 	"github.com/patrickmn/go-cache"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
@@ -33,6 +35,7 @@ func (s *Signer) Sign(req *http.Request, signRegion string, signTime time.Time) 
 const (
 	indexDocument  = "index.html"
 	policyDocument = "capiaccess.txt"
+	psPrefix       = "/capi"
 )
 
 // https://docs.aws.amazon.com/elasticloadbalancing/latest/application/listener-authenticate-users.html
@@ -43,15 +46,32 @@ type ALBOIDCClaimSet struct {
 	Exp   int64  `json:"exp"`
 }
 
+type S3Endpoint struct {
+	Bucket string `json:"bucket"`
+	Region string `json:"region"`
+}
+
+func (ep S3Endpoint) Valid() bool {
+	return ep.Bucket != "" && ep.Region != ""
+}
+
+func (ep S3Endpoint) URL() *url.URL {
+	if !ep.Valid() {
+		return nil
+	}
+	u, _ := url.Parse(fmt.Sprintf("https://%s.s3-%s.amazonaws.com", ep.Bucket, ep.Region))
+	return u
+}
+
 var jwtExpSkew = time.Minute
 
-func FromALBOIDCClaimSetContext(ctx context.Context) ALBOIDCClaimSet {
+func ALBOIDCClaimSetFromContext(ctx context.Context) ALBOIDCClaimSet {
 	v, _ := ctx.Value(ctxClaimSet).(ALBOIDCClaimSet)
 	return v
 }
 
-func FromS3EndpointJWT(ctx context.Context) S3EndpointJWT {
-	v, _ := ctx.Value(ctxS3EndpointJWT).(S3EndpointJWT)
+func S3EndpointFromContext(ctx context.Context) S3Endpoint {
+	v, _ := ctx.Value(ctxS3Endpoint).(S3Endpoint)
 	return v
 }
 
@@ -59,8 +79,53 @@ type capiHTTPContext int
 
 const (
 	ctxClaimSet capiHTTPContext = iota
-	ctxS3EndpointJWT
+	ctxS3Endpoint
 )
+
+type S3EndpointResolver struct {
+	PSClient *psadm.CachedClient
+	Cache    *cache.Cache
+}
+
+func (r *S3EndpointResolver) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
+	s3ep, err := r.resolveEndpoint(req.Host)
+	if err != nil {
+		hlog.FromRequest(req).Info().Err(err).Msg("failed to find configuration")
+		http.NotFound(rw, req)
+		return
+	}
+
+	req = req.WithContext(context.WithValue(req.Context(), ctxS3Endpoint, s3ep))
+	next(rw, req)
+}
+
+func (r *S3EndpointResolver) isNotFound(hostHeader string) bool {
+	_, ok := r.Cache.Get(fmt.Sprintf("__capi/notfound/%s", hostHeader))
+	return ok
+}
+
+func (r *S3EndpointResolver) resolveEndpoint(hostHeader string) (S3Endpoint, error) {
+	host := strings.Replace(hostHeader, ":", "_", 1)
+
+	ck := fmt.Sprintf("__capi/error/%s", host)
+
+	if cachedErr, ok := r.Cache.Get(ck); ok {
+		return S3Endpoint{}, fmt.Errorf("getting parameter (cached): %w", cachedErr.(error))
+	}
+
+	param, err := r.PSClient.GetParameter(fmt.Sprintf("%s/hosts/%s", psPrefix, host))
+	if err != nil {
+		r.Cache.Set(ck, err, cache.DefaultExpiration)
+		return S3Endpoint{}, fmt.Errorf("getting parameter: %w", err)
+	}
+
+	var v S3Endpoint
+	if err := json.Unmarshal([]byte(param), &v); err != nil {
+		return S3Endpoint{}, fmt.Errorf("decoding: %w", err)
+	}
+
+	return v, nil
+}
 
 type Authorizer struct {
 	Signer *Signer
@@ -68,7 +133,7 @@ type Authorizer struct {
 }
 
 func (a *Authorizer) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
-	s3Endpoint := FromS3EndpointJWT(req.Context())
+	s3Endpoint := S3EndpointFromContext(req.Context())
 	log := hlog.FromRequest(req).With().Str("s3_endpoint", s3Endpoint.URL().String()).Logger()
 	policy, err := a.lookupPolicy(s3Endpoint)
 	if err != nil {
@@ -77,7 +142,7 @@ func (a *Authorizer) ServeHTTP(rw http.ResponseWriter, req *http.Request, next h
 		return
 	}
 
-	claim := FromALBOIDCClaimSetContext(req.Context())
+	claim := ALBOIDCClaimSetFromContext(req.Context())
 	for _, pol := range policy {
 		if Authorize(claim.Email, pol) {
 			next(rw, req)
@@ -88,7 +153,7 @@ func (a *Authorizer) ServeHTTP(rw http.ResponseWriter, req *http.Request, next h
 	http.Error(rw, "Unauthorized", http.StatusUnauthorized)
 }
 
-func (a *Authorizer) lookupPolicy(s3Endpoint S3EndpointJWT) ([]string, error) {
+func (a *Authorizer) lookupPolicy(s3Endpoint S3Endpoint) ([]string, error) {
 	if policy, found := a.Cache.Get(s3Endpoint.URL().String()); found {
 		return policy.([]string), nil
 	}
@@ -102,7 +167,7 @@ func (a *Authorizer) lookupPolicy(s3Endpoint S3EndpointJWT) ([]string, error) {
 	return policy, nil
 }
 
-func (a *Authorizer) fetchPolicy(s3Endpoint S3EndpointJWT) ([]string, error) {
+func (a *Authorizer) fetchPolicy(s3Endpoint S3Endpoint) ([]string, error) {
 	policyURL, err := s3Endpoint.URL().Parse("/" + policyDocument)
 	if err != nil {
 		return nil, err
@@ -153,7 +218,7 @@ func (a *Authenticator) ServeHTTP(rw http.ResponseWriter, req *http.Request, nex
 
 func (a *Authenticator) LogWithSub(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
 	log := zerolog.Ctx(req.Context())
-	claim := FromALBOIDCClaimSetContext(req.Context())
+	claim := ALBOIDCClaimSetFromContext(req.Context())
 	log.UpdateContext(func(c zerolog.Context) zerolog.Context {
 		return c.Str("sub", claim.Sub)
 	})
@@ -214,7 +279,7 @@ func verifyExp(now time.Time, skew time.Duration, exp int64) bool {
 func NewProxy(signer *Signer) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
-			s3Endpoint := FromS3EndpointJWT(req.Context())
+			s3Endpoint := S3EndpointFromContext(req.Context())
 
 			s3url := s3Endpoint.URL()
 			req.Host = s3url.Host
@@ -245,7 +310,7 @@ func DebugHandler(dir func(*http.Request)) http.HandlerFunc {
 	return func(rw http.ResponseWriter, req *http.Request) {
 		dir(req)
 
-		claim := FromALBOIDCClaimSetContext(req.Context())
+		claim := ALBOIDCClaimSetFromContext(req.Context())
 
 		rw.Header().Set("Content-Type", "text/plain")
 		fmt.Fprintf(rw, "%#v\n", req)

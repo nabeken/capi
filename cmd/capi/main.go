@@ -1,16 +1,17 @@
 package main
 
 import (
+	"flag"
 	"net/http"
 	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/session"
 	v4signer "github.com/aws/aws-sdk-go/aws/signer/v4"
-	"github.com/aws/aws-sdk-go/service/secretsmanager"
 	"github.com/fujiwara/ridge"
 	"github.com/nabeken/capi"
 	"github.com/nabeken/go-jwkset"
+	"github.com/nabeken/psadm"
 	"github.com/patrickmn/go-cache"
 	"github.com/rs/zerolog"
 	"github.com/urfave/negroni"
@@ -18,6 +19,9 @@ import (
 )
 
 func main() {
+	var dev = flag.Bool("dev", false, "enable dev mode")
+	flag.Parse()
+
 	log := zerolog.New(os.Stdout).With().
 		Timestamp().
 		Str("app", "capi").
@@ -28,17 +32,7 @@ func main() {
 		log.Fatal().Msg("Please set AWS_REGION environment variable.")
 	}
 
-	dnsSigningKeyPath := os.Getenv("CAPI_DNS_SIGNING_KEY_PATH")
-	if dnsSigningKeyPath == "" {
-		log.Fatal().Msg("Please set CAPI_DNS_SIGNING_KEY_PATH environment variable.")
-	}
-
 	sess := session.Must(session.NewSession())
-
-	dnsSigningKey, err := capi.GetDNSSigningKey(secretsmanager.New(sess), dnsSigningKeyPath)
-	if err != nil {
-		log.Fatal().Err(err).Msg("failed to load the DNS signing key")
-	}
 
 	signer := &capi.Signer{
 		Signer: v4signer.NewSigner(sess.Config.Credentials),
@@ -61,9 +55,10 @@ func main() {
 		Cache:  cache.New(time.Minute, time.Minute),
 	}
 
-	s3EndpointResolver := &capi.DNSS3EndpointResolver{
-		Cache: cache.New(time.Minute, time.Minute),
-		JWK:   dnsSigningKey,
+	resolverCache := cache.New(time.Minute, time.Minute)
+	s3EndpointResolver := &capi.S3EndpointResolver{
+		PSClient: psadm.NewClient(sess).CachedClient(resolverCache),
+		Cache:    resolverCache,
 	}
 
 	n := negroni.New(
@@ -71,15 +66,19 @@ func main() {
 		&capi.Logger{L: log},
 	)
 
-	// check the requested host configures the DNS record to establish a S3 bucket mapping
+	// check whether the requested host is allowed
 	n.Use(s3EndpointResolver)
 
 	// check the ALB-signed JWT
-	n.Use(authenticator)
-	n.UseFunc(authenticator.LogWithSub)
+	if !*dev {
+		n.Use(authenticator)
+		n.UseFunc(authenticator.LogWithSub)
 
-	// check ACL in the requested S3 bucket
-	n.Use(authorizer)
+		// check ACL in the requested S3 bucket
+		n.Use(authorizer)
+	} else {
+		log.Warn().Msg("dev mode is enabled. Authn and authz is completely disabled.")
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/", rp)
