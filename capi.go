@@ -99,11 +99,6 @@ func (r *S3EndpointResolver) ServeHTTP(rw http.ResponseWriter, req *http.Request
 	next(rw, req)
 }
 
-func (r *S3EndpointResolver) isNotFound(hostHeader string) bool {
-	_, ok := r.Cache.Get(fmt.Sprintf("__capi/notfound/%s", hostHeader))
-	return ok
-}
-
 func (r *S3EndpointResolver) resolveEndpoint(hostHeader string) (S3Endpoint, error) {
 	host := strings.Replace(hostHeader, ":", "_", 1)
 
