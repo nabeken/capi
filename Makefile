@@ -13,6 +13,9 @@ zip: build
 build:
 	GOOS=linux GOARCH=amd64 go build -o _build/main $(CMD)
 
+dev:
+	go build -o _build/main.dev $(CMD)
+
 clean:
 	@rm -rf _build
 
