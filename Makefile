@@ -19,4 +19,4 @@ dev:
 clean:
 	@rm -rf _build
 
-.PHONY: build zip publish
+.PHONY: build zip publish clean dev
