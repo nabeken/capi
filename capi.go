@@ -14,7 +14,6 @@ import (
 
 	v4signer "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/nabeken/go-jwkset"
-	"github.com/nabeken/psadm"
 	"github.com/patrickmn/go-cache"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
@@ -83,8 +82,11 @@ const (
 )
 
 type S3EndpointResolver struct {
-	PSClient *psadm.CachedClient
-	Cache    *cache.Cache
+	PSClient interface {
+		GetParameter(string) (string, error)
+	}
+
+	Cache *cache.Cache
 }
 
 func (r *S3EndpointResolver) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
