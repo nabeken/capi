@@ -2,6 +2,9 @@ package capi
 
 import (
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -23,7 +26,9 @@ func (c *psMockClient) GetParameter(key string) (string, error) {
 func TestS3EndpointResolver(t *testing.T) {
 
 	cache := cache.New(time.Minute, time.Minute)
-	mockClient := &psMockClient{}
+	mockClient := &psMockClient{
+		Param: `{"bucket":"test","region":"test"}`,
+	}
 
 	r := &S3EndpointResolver{
 		Cache:    cache,
@@ -44,8 +49,6 @@ func TestS3EndpointResolver(t *testing.T) {
 			Bucket: "test",
 			Region: "test",
 		}
-
-		mockClient.Param = `{"bucket":"test","region":"test"}`
 
 		actual, err := r.resolveEndpoint("example.com")
 		assert.NoError(err)
@@ -77,5 +80,43 @@ func TestS3EndpointResolver(t *testing.T) {
 
 		_, err := r.resolveEndpoint("example.com")
 		assert.Contains(err.Error(), "(cached)")
+	})
+
+	// clear the cache and mock
+	mockClient.Err = nil
+	cache.Flush()
+
+	t.Run("success ServeHTTP", func(t *testing.T) {
+		assert := assert.New(t)
+
+		var actualS3ep S3Endpoint
+		handler := func(rw http.ResponseWriter, req *http.Request) {
+			actualS3ep = S3EndpointFromContext(req.Context())
+			io.WriteString(rw, "it worked.")
+		}
+
+		rw := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+		r.ServeHTTP(rw, req, handler)
+
+		assert.Equal("it worked.", rw.Body.String())
+		assert.Equal(http.StatusOK, rw.Code)
+		assert.Equal("/capi/hosts/example.com", mockClient.Arg)
+		assert.Equal(S3Endpoint{Bucket: "test", Region: "test"}, actualS3ep)
+	})
+
+	t.Run("404 ServeHTTP", func(t *testing.T) {
+		assert := assert.New(t)
+
+		mockClient.Err = errors.New("not found")
+
+		rw := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "https://example.com:8080/", nil)
+		r.ServeHTTP(rw, req, func(_ http.ResponseWriter, _ *http.Request) {
+			panic("should not be invoked")
+		})
+
+		assert.Equal(http.StatusNotFound, rw.Code)
+		assert.Equal("/capi/hosts/example.com_8080", mockClient.Arg)
 	})
 }
