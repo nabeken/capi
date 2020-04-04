@@ -21,11 +21,15 @@ import (
 	"gopkg.in/square/go-jose.v2"
 )
 
-type Signer struct {
+type Signer interface {
+	Sign(*http.Request, string, time.Time) error
+}
+
+type AWSSigner struct {
 	Signer *v4signer.Signer
 }
 
-func (s *Signer) Sign(req *http.Request, signRegion string, signTime time.Time) error {
+func (s *AWSSigner) Sign(req *http.Request, signRegion string, signTime time.Time) error {
 	// Only GET and HEAD supported
 	_, err := s.Signer.Sign(req, nil, "s3", signRegion, signTime)
 	return err
@@ -124,9 +128,15 @@ func (r *S3EndpointResolver) resolveEndpoint(hostHeader string) (S3Endpoint, err
 	return v, nil
 }
 
+// Authorizer authorizes access to authenticated user based on policy document.
 type Authorizer struct {
-	Signer *Signer
-	Cache  *cache.Cache
+	Signer Signer
+
+	Doer interface {
+		Do(*http.Request) (*http.Response, error)
+	}
+
+	Cache *cache.Cache
 }
 
 func (a *Authorizer) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
@@ -176,10 +186,10 @@ func (a *Authorizer) fetchPolicy(s3Endpoint S3Endpoint) ([]string, error) {
 	}
 
 	if err := a.Signer.Sign(req, s3Endpoint.Region, time.Now()); err != nil {
-		panic(err)
+		return nil, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := a.Doer.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -273,7 +283,7 @@ func verifyExp(now time.Time, skew time.Duration, exp int64) bool {
 	return now.Before(skewT)
 }
 
-func NewProxy(signer *Signer) *httputil.ReverseProxy {
+func NewProxy(signer Signer) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			s3Endpoint := S3EndpointFromContext(req.Context())
