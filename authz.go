@@ -1,6 +1,7 @@
 package capi
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -11,12 +12,12 @@ func Authorize(target, pattern string) bool {
 	}
 
 	if strings.HasPrefix(pattern, "re/") {
-		matched, err := regexp.MatchString(pattern[3:], target)
+		matched, err := regexp.MatchString(fmt.Sprintf("(?i:%s)", pattern[3:]), target)
 		if err != nil {
 			return false
 		}
 		return matched
 	}
 
-	return target == pattern
+	return strings.EqualFold(target, pattern)
 }
