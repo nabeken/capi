@@ -2,16 +2,24 @@ package capi
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/nabeken/go-jwkset"
 	"github.com/patrickmn/go-cache"
 	"github.com/stretchr/testify/assert"
+	"gopkg.in/square/go-jose.v2"
 )
 
 type psMockClient struct {
@@ -256,4 +264,199 @@ func TestAuthorizer(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestAuthenticator(t *testing.T) {
+	// create two keys
+	key1 := mustGenerateKey("1")
+	signer1 := mustSigner(key1)
+
+	key2 := mustGenerateKey("2")
+	signer2 := mustSigner(key2)
+
+	authnr := &Authenticator{
+		JWKFetcher: mustTestJWKFetcher(key1.Public(), key2.Public()),
+	}
+
+	expected1 := ALBOIDCClaimSet{
+		Iss:   "issuer",
+		Sub:   "1",
+		Email: "1@example.com",
+		Exp:   time.Now().Add(time.Hour).Unix(),
+	}
+	signed1 := mustSignClaim(signer1, expected1)
+
+	expected2 := ALBOIDCClaimSet{
+		Iss:   "issuer",
+		Sub:   "2",
+		Email: "2@example.com",
+		Exp:   time.Now().Add(time.Hour).Unix(),
+	}
+	signed2 := mustSignClaim(signer2, expected2)
+
+	unknownKey := mustGenerateKey("unknown")
+	unknownSigner := mustSigner(unknownKey)
+
+	t.Run("verifyJWT", func(t *testing.T) {
+		t.Run("verify", func(t *testing.T) {
+			assert := assert.New(t)
+
+			for _, tc := range []struct {
+				Expected ALBOIDCClaimSet
+				Signed   string
+			}{
+				{
+					Expected: expected1,
+					Signed:   signed1,
+				},
+				{
+					Expected: expected2,
+					Signed:   signed2,
+				},
+			} {
+				actual, err := authnr.verifyJWT(tc.Signed)
+				assert.NoError(err, tc.Expected)
+				assert.Equal(tc.Expected, actual, tc.Expected)
+			}
+		})
+
+		t.Run("invalid JWT", func(t *testing.T) {
+			assert := assert.New(t)
+
+			invalidJWT := replacePayload(signed1, extractPayload(signed2))
+
+			_, err := authnr.verifyJWT(invalidJWT)
+			assert.Error(err)
+		})
+
+		t.Run("expired JWT", func(t *testing.T) {
+			assert := assert.New(t)
+
+			signed := mustSignClaim(signer1, ALBOIDCClaimSet{
+				Iss:   "issuer",
+				Sub:   "1",
+				Email: "1@example.com",
+				Exp:   time.Now().Add(-time.Hour).Unix(),
+			})
+
+			_, err := authnr.verifyJWT(signed)
+			assert.Error(err)
+			assert.EqualError(err, "exp expired")
+		})
+
+		t.Run("signed with unknown key", func(t *testing.T) {
+			assert := assert.New(t)
+
+			signed := mustSignClaim(unknownSigner, expected1)
+			_, err := authnr.verifyJWT(signed)
+			assert.EqualError(err, "no valid key to verify")
+		})
+	})
+
+	t.Run("ServeHTTP", func(t *testing.T) {
+		handler := func(actual *ALBOIDCClaimSet) http.HandlerFunc {
+			return func(rw http.ResponseWriter, req *http.Request) {
+				claim := ALBOIDCClaimSetFromContext(req.Context())
+				*actual = claim
+				io.WriteString(rw, "it worked.")
+			}
+		}
+
+		tcs := map[string]struct {
+			Signed        string
+			ExpectedCode  int
+			ExpectedClaim *ALBOIDCClaimSet
+		}{
+			"success": {
+				Signed:        signed1,
+				ExpectedCode:  http.StatusOK,
+				ExpectedClaim: &expected1,
+			},
+			"error": {
+				Signed:       mustSignClaim(unknownSigner, expected1),
+				ExpectedCode: http.StatusUnauthorized,
+			},
+		}
+
+		for name, tc := range tcs {
+			t.Run(name, func(t *testing.T) {
+				assert := assert.New(t)
+
+				rw := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodGet, "https://example.com:8080/", nil)
+				req.Header.Set(headerXamznOidcData, tc.Signed)
+
+				var actual ALBOIDCClaimSet
+				authnr.ServeHTTP(rw, req, handler(&actual))
+
+				assert.Equal(tc.ExpectedCode, rw.Code)
+
+				if tc.ExpectedClaim != nil {
+					assert.Equal(*tc.ExpectedClaim, actual)
+				}
+			})
+		}
+	})
+}
+
+func extractPayload(jwt string) string {
+	return strings.Split(jwt, ".")[1]
+}
+
+func replacePayload(jwt, newPayload string) string {
+	tokens := strings.Split(jwt, ".")
+	tokens[1] = newPayload
+	return strings.Join(tokens, ".")
+}
+
+func mustSignClaim(signer jose.Signer, claim ALBOIDCClaimSet) string {
+	payload, err := json.Marshal(claim)
+	if err != nil {
+		panic(fmt.Errorf("marshaling claim: %w", err))
+	}
+
+	signed, err := signer.Sign(payload)
+	if err != nil {
+		panic(fmt.Errorf("signing: %w", err))
+	}
+
+	signedStr, err := signed.CompactSerialize()
+	if err != nil {
+		panic(fmt.Errorf("serializing payload: %w", err))
+	}
+
+	return signedStr
+}
+
+func mustTestJWKFetcher(pubkeys ...jose.JSONWebKey) jwkset.Fetcher {
+	jwks := jose.JSONWebKeySet{Keys: pubkeys}
+	rawJWKs, err := json.Marshal(jwks)
+	if err != nil {
+		panic(fmt.Errorf("marshaling JWKs: %w", err))
+	}
+
+	return &jwkset.InMemoryFetcher{RAWJWKs: rawJWKs}
+}
+
+func mustSigner(key jose.JSONWebKey) jose.Signer {
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: key}, nil)
+	if err != nil {
+		panic(fmt.Errorf("creating signer: %w", err))
+	}
+	return signer
+}
+
+// mustGenerateKey returns a private key JWK for testing.
+func mustGenerateKey(kid string) jose.JSONWebKey {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(fmt.Errorf("generating key: %w", err))
+	}
+
+	return jose.JSONWebKey{
+		KeyID:     kid,
+		Key:       key,
+		Algorithm: string(jose.ES256),
+		Use:       "sig",
+	}
 }

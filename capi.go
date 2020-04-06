@@ -39,6 +39,8 @@ const (
 	indexDocument  = "index.html"
 	policyDocument = "capiaccess.txt"
 	psPrefix       = "/capi"
+
+	headerXamznOidcData = "x-amzn-oidc-data"
 )
 
 // https://docs.aws.amazon.com/elasticloadbalancing/latest/application/listener-authenticate-users.html
@@ -212,23 +214,19 @@ type Authenticator struct {
 }
 
 func (a *Authenticator) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
-	claim, err := a.verifyJWT(req.Header.Get("x-amzn-oidc-data"))
+	claim, err := a.verifyJWT(req.Header.Get(headerXamznOidcData))
 	if err != nil {
 		hlog.FromRequest(req).Info().Err(err).Msg("unable to verify JWT")
 		http.Error(rw, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	req = req.WithContext(context.WithValue(req.Context(), ctxClaimSet, claim))
-	next(rw, req)
-}
-
-func (a *Authenticator) LogWithSub(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
 	log := zerolog.Ctx(req.Context())
-	claim := ALBOIDCClaimSetFromContext(req.Context())
 	log.UpdateContext(func(c zerolog.Context) zerolog.Context {
 		return c.Str("sub", claim.Sub)
 	})
+
+	req = req.WithContext(context.WithValue(req.Context(), ctxClaimSet, claim))
 	next(rw, req)
 }
 
@@ -251,6 +249,10 @@ func (a *Authenticator) verifyJWT(data string) (ALBOIDCClaimSet, error) {
 	var verified bool
 	var verifyErr error
 	for _, k := range jwkobj.Keys {
+		if k.KeyID != sig.Header.KeyID {
+			continue
+		}
+
 		payload, err := jwsobj.Verify(k)
 		if err == nil {
 			verifiedPayload = payload
@@ -262,7 +264,10 @@ func (a *Authenticator) verifyJWT(data string) (ALBOIDCClaimSet, error) {
 	}
 
 	if !verified {
-		return ALBOIDCClaimSet{}, fmt.Errorf("verifying: %w", verifyErr)
+		if verifyErr != nil {
+			return ALBOIDCClaimSet{}, fmt.Errorf("verifying: %w", verifyErr)
+		}
+		return ALBOIDCClaimSet{}, errors.New("no valid key to verify")
 	}
 
 	claim := ALBOIDCClaimSet{}
