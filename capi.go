@@ -13,11 +13,11 @@ import (
 	"time"
 
 	v4signer "github.com/aws/aws-sdk-go/aws/signer/v4"
+	"github.com/go-chi/chi/middleware"
 	"github.com/nabeken/go-jwkset"
 	"github.com/patrickmn/go-cache"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
-	"github.com/urfave/negroni"
 	"gopkg.in/square/go-jose.v2"
 )
 
@@ -95,16 +95,18 @@ type S3EndpointResolver struct {
 	Cache *cache.Cache
 }
 
-func (r *S3EndpointResolver) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
-	s3ep, err := r.resolveEndpoint(req.Host)
-	if err != nil {
-		hlog.FromRequest(req).Info().Err(err).Msg("failed to find configuration")
-		http.NotFound(rw, req)
-		return
-	}
+func (r *S3EndpointResolver) Handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		s3ep, err := r.resolveEndpoint(req.Host)
+		if err != nil {
+			hlog.FromRequest(req).Info().Err(err).Msg("failed to find configuration")
+			http.NotFound(rw, req)
+			return
+		}
 
-	req = req.WithContext(context.WithValue(req.Context(), ctxS3Endpoint, s3ep))
-	next(rw, req)
+		req = req.WithContext(context.WithValue(req.Context(), ctxS3Endpoint, s3ep))
+		next.ServeHTTP(rw, req)
+	})
 }
 
 func (r *S3EndpointResolver) resolveEndpoint(hostHeader string) (S3Endpoint, error) {
@@ -141,25 +143,27 @@ type Authorizer struct {
 	Cache *cache.Cache
 }
 
-func (a *Authorizer) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
-	s3Endpoint := S3EndpointFromContext(req.Context())
-	log := hlog.FromRequest(req).With().Str("s3_endpoint", s3Endpoint.URL().String()).Logger()
-	policy, err := a.lookupPolicy(s3Endpoint)
-	if err != nil {
-		log.Info().Err(err).Msg("failed to lookup policy")
-		http.Error(rw, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	claim := ALBOIDCClaimSetFromContext(req.Context())
-	for _, pol := range policy {
-		if Authorize(claim.Email, pol) {
-			next(rw, req)
+func (a *Authorizer) Handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		s3Endpoint := S3EndpointFromContext(req.Context())
+		log := hlog.FromRequest(req).With().Str("s3_endpoint", s3Endpoint.URL().String()).Logger()
+		policy, err := a.lookupPolicy(s3Endpoint)
+		if err != nil {
+			log.Info().Err(err).Msg("failed to lookup policy")
+			http.Error(rw, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-	}
 
-	http.Error(rw, "Unauthorized", http.StatusUnauthorized)
+		claim := ALBOIDCClaimSetFromContext(req.Context())
+		for _, pol := range policy {
+			if Authorize(claim.Email, pol) {
+				next.ServeHTTP(rw, req)
+				return
+			}
+		}
+
+		http.Error(rw, "Unauthorized", http.StatusUnauthorized)
+	})
 }
 
 func (a *Authorizer) lookupPolicy(s3Endpoint S3Endpoint) ([]string, error) {
@@ -213,21 +217,23 @@ type Authenticator struct {
 	JWKFetcher jwkset.Fetcher
 }
 
-func (a *Authenticator) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
-	claim, err := a.verifyJWT(req.Header.Get(headerXamznOidcData))
-	if err != nil {
-		hlog.FromRequest(req).Info().Err(err).Msg("unable to verify JWT")
-		http.Error(rw, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
+func (a *Authenticator) Handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		claim, err := a.verifyJWT(req.Header.Get(headerXamznOidcData))
+		if err != nil {
+			hlog.FromRequest(req).Info().Err(err).Msg("unable to verify JWT")
+			http.Error(rw, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
 
-	log := zerolog.Ctx(req.Context())
-	log.UpdateContext(func(c zerolog.Context) zerolog.Context {
-		return c.Str("sub", claim.Sub)
+		log := zerolog.Ctx(req.Context())
+		log.UpdateContext(func(c zerolog.Context) zerolog.Context {
+			return c.Str("sub", claim.Sub)
+		})
+
+		req = req.WithContext(context.WithValue(req.Context(), ctxClaimSet, claim))
+		next.ServeHTTP(rw, req)
 	})
-
-	req = req.WithContext(context.WithValue(req.Context(), ctxClaimSet, claim))
-	next(rw, req)
 }
 
 func (a *Authenticator) verifyJWT(data string) (ALBOIDCClaimSet, error) {
@@ -335,22 +341,23 @@ type Logger struct {
 	L zerolog.Logger
 }
 
-func (l *Logger) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
-	start := time.Now()
+func (l *Logger) Handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		start := time.Now()
 
-	rl := l.L.With().
-		Str("hostname", req.Host).
-		Str("method", req.Method).
-		Str("path", req.URL.Path).Logger()
+		rl := l.L.With().
+			Str("hostname", req.Host).
+			Str("method", req.Method).
+			Str("path", req.URL.Path).Logger()
 
-	req = req.WithContext(rl.WithContext(req.Context()))
+		req = req.WithContext(rl.WithContext(req.Context()))
 
-	next(rw, req)
+		wrw := middleware.NewWrapResponseWriter(rw, req.ProtoMajor)
+		next.ServeHTTP(wrw, req)
 
-	res := rw.(negroni.ResponseWriter)
-
-	rl.Info().
-		Int("status", res.Status()).
-		Dur("duration", time.Since(start)).
-		Msg("completed.")
+		rl.Info().
+			Int("status", wrw.Status()).
+			Dur("duration", time.Since(start)).
+			Msg("completed.")
+	})
 }

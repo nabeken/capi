@@ -100,14 +100,14 @@ func TestS3EndpointResolver(t *testing.T) {
 		assert := assert.New(t)
 
 		var actualS3ep S3Endpoint
-		handler := func(rw http.ResponseWriter, req *http.Request) {
+		handler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 			actualS3ep = S3EndpointFromContext(req.Context())
 			io.WriteString(rw, "it worked.")
-		}
+		})
 
 		rw := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
-		r.ServeHTTP(rw, req, handler)
+		r.Handler(handler).ServeHTTP(rw, req)
 
 		assert.Equal("it worked.", rw.Body.String())
 		assert.Equal(http.StatusOK, rw.Code)
@@ -122,9 +122,10 @@ func TestS3EndpointResolver(t *testing.T) {
 
 		rw := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "https://example.com:8080/", nil)
-		r.ServeHTTP(rw, req, func(_ http.ResponseWriter, _ *http.Request) {
+
+		r.Handler(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 			panic("should not be invoked")
-		})
+		})).ServeHTTP(rw, req)
 
 		assert.Equal(http.StatusNotFound, rw.Code)
 		assert.Equal("/capi/hosts/example.com_8080", mockClient.Arg)
@@ -213,9 +214,9 @@ func TestAuthorizer(t *testing.T) {
 	})
 
 	t.Run("ServeHTTP", func(t *testing.T) {
-		handler := func(rw http.ResponseWriter, req *http.Request) {
+		handler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 			io.WriteString(rw, "it worked.")
-		}
+		})
 
 		type testCase struct {
 			Email  string
@@ -257,7 +258,7 @@ func TestAuthorizer(t *testing.T) {
 					},
 				))
 
-				authzr.ServeHTTP(rw, req, handler)
+				authzr.Handler(handler).ServeHTTP(rw, req)
 
 				assert := assert.New(t)
 				assert.Equal(tc.ExpectedCode, rw.Code)
@@ -387,7 +388,7 @@ func TestAuthenticator(t *testing.T) {
 				req.Header.Set(headerXamznOidcData, tc.Signed)
 
 				var actual ALBOIDCClaimSet
-				authnr.ServeHTTP(rw, req, handler(&actual))
+				authnr.Handler(handler(&actual)).ServeHTTP(rw, req)
 
 				assert.Equal(tc.ExpectedCode, rw.Code)
 

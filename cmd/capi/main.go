@@ -9,12 +9,13 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	v4signer "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/fujiwara/ridge"
+	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/middleware"
 	"github.com/nabeken/capi"
 	"github.com/nabeken/go-jwkset"
 	"github.com/nabeken/psadm"
 	"github.com/patrickmn/go-cache"
 	"github.com/rs/zerolog"
-	"github.com/urfave/negroni"
 	"gopkg.in/square/go-jose.v2"
 )
 
@@ -62,28 +63,27 @@ func main() {
 		Cache:    resolverCache,
 	}
 
-	n := negroni.New(
-		negroni.NewRecovery(),
-		&capi.Logger{L: log},
-	)
+	logger := &capi.Logger{L: log}
+
+	r := chi.NewRouter()
+	r.Use(middleware.Recoverer)
+	r.Use(logger.Handler)
 
 	// check whether the requested host is allowed
-	n.Use(s3EndpointResolver)
+	r.Use(s3EndpointResolver.Handler)
 
 	// check the ALB-signed JWT
 	if !*dev {
-		n.Use(authenticator)
+		r.Use(authenticator.Handler)
 
 		// check ACL in the requested S3 bucket
-		n.Use(authorizer)
+		r.Use(authorizer.Handler)
 	} else {
 		log.Warn().Msg("dev mode is enabled. Authn and authz is completely disabled.")
 	}
 
-	mux := http.NewServeMux()
-	mux.Handle("/", rp)
-	mux.HandleFunc("/_debug", capi.DebugHandler(rp.Director))
-	n.UseHandler(mux)
+	r.Get("/_debug", capi.DebugHandler(rp.Director))
+	r.Handle("/*", rp)
 
-	ridge.Run(":8080", "/", n)
+	ridge.Run(":8080", "/", r)
 }
