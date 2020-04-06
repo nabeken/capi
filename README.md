@@ -11,7 +11,7 @@
 ## How it works
 
 - `ALB` authenticates you by OpenID Connect.
-- After the authentication succeeds, that, `ALB` routes a request to `capi` running on Lambda.
+- After the authentication succeeds, `ALB` routes a request to `capi` running on Lambda.
 - `capi` checks the JWT signed by `ALB` in `x-amzn-oidc-data` request header.
 - `capi` picks up a destination backend S3 by looking up `host` request header.
   - `capi` use AWS Parameter Store to store the configuration.
