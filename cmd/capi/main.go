@@ -73,7 +73,6 @@ func main() {
 	// check the ALB-signed JWT
 	if !*dev {
 		n.Use(authenticator)
-		n.UseFunc(authenticator.LogWithSub)
 
 		// check ACL in the requested S3 bucket
 		n.Use(authorizer)
