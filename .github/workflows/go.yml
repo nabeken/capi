@@ -1,10 +1,8 @@
 name: Go
 
 on:
-  push:
-    branches: [ master develop ]
-  pull_request:
-    branches: [ master ]
+  - push
+  - pull_request
 
 jobs:
 
@@ -34,4 +32,4 @@ jobs:
       run: go build -v ./...
 
     - name: Test
-      run: go test -v
+      run: go test -v -cover

@@ -15,6 +15,11 @@ func TestAuthorize(t *testing.T) {
 	}{
 		{
 			Target:     "foo@example.com",
+			Pattern:    "Foo@example.com",
+			Authorized: true,
+		},
+		{
+			Target:     "foo@example.com",
 			Pattern:    "foo@example.com",
 			Authorized: true,
 		},
@@ -27,6 +32,11 @@ func TestAuthorize(t *testing.T) {
 		{
 			Target:     "foo@example.com",
 			Pattern:    `re/@example\.com$`,
+			Authorized: true,
+		},
+		{
+			Target:     "foo@example.com",
+			Pattern:    `re/@Example\.com$`,
 			Authorized: true,
 		},
 		{

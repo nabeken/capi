@@ -34,7 +34,7 @@ func main() {
 
 	sess := session.Must(session.NewSession())
 
-	signer := &capi.Signer{
+	signer := &capi.AWSSigner{
 		Signer: v4signer.NewSigner(sess.Config.Credentials),
 	}
 
@@ -52,6 +52,7 @@ func main() {
 
 	authorizer := &capi.Authorizer{
 		Signer: signer,
+		Doer:   http.DefaultClient,
 		Cache:  cache.New(time.Minute, time.Minute),
 	}
 
@@ -72,7 +73,6 @@ func main() {
 	// check the ALB-signed JWT
 	if !*dev {
 		n.Use(authenticator)
-		n.UseFunc(authenticator.LogWithSub)
 
 		// check ACL in the requested S3 bucket
 		n.Use(authorizer)

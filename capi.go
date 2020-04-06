@@ -14,7 +14,6 @@ import (
 
 	v4signer "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/nabeken/go-jwkset"
-	"github.com/nabeken/psadm"
 	"github.com/patrickmn/go-cache"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
@@ -22,11 +21,15 @@ import (
 	"gopkg.in/square/go-jose.v2"
 )
 
-type Signer struct {
+type Signer interface {
+	Sign(*http.Request, string, time.Time) error
+}
+
+type AWSSigner struct {
 	Signer *v4signer.Signer
 }
 
-func (s *Signer) Sign(req *http.Request, signRegion string, signTime time.Time) error {
+func (s *AWSSigner) Sign(req *http.Request, signRegion string, signTime time.Time) error {
 	// Only GET and HEAD supported
 	_, err := s.Signer.Sign(req, nil, "s3", signRegion, signTime)
 	return err
@@ -36,6 +39,8 @@ const (
 	indexDocument  = "index.html"
 	policyDocument = "capiaccess.txt"
 	psPrefix       = "/capi"
+
+	headerXamznOidcData = "x-amzn-oidc-data"
 )
 
 // https://docs.aws.amazon.com/elasticloadbalancing/latest/application/listener-authenticate-users.html
@@ -83,8 +88,11 @@ const (
 )
 
 type S3EndpointResolver struct {
-	PSClient *psadm.CachedClient
-	Cache    *cache.Cache
+	PSClient interface {
+		GetParameter(string) (string, error)
+	}
+
+	Cache *cache.Cache
 }
 
 func (r *S3EndpointResolver) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
@@ -122,9 +130,15 @@ func (r *S3EndpointResolver) resolveEndpoint(hostHeader string) (S3Endpoint, err
 	return v, nil
 }
 
+// Authorizer authorizes access to authenticated user based on policy document.
 type Authorizer struct {
-	Signer *Signer
-	Cache  *cache.Cache
+	Signer Signer
+
+	Doer interface {
+		Do(*http.Request) (*http.Response, error)
+	}
+
+	Cache *cache.Cache
 }
 
 func (a *Authorizer) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
@@ -174,10 +188,10 @@ func (a *Authorizer) fetchPolicy(s3Endpoint S3Endpoint) ([]string, error) {
 	}
 
 	if err := a.Signer.Sign(req, s3Endpoint.Region, time.Now()); err != nil {
-		panic(err)
+		return nil, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := a.Doer.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -200,23 +214,19 @@ type Authenticator struct {
 }
 
 func (a *Authenticator) ServeHTTP(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
-	claim, err := a.verifyJWT(req.Header.Get("x-amzn-oidc-data"))
+	claim, err := a.verifyJWT(req.Header.Get(headerXamznOidcData))
 	if err != nil {
 		hlog.FromRequest(req).Info().Err(err).Msg("unable to verify JWT")
 		http.Error(rw, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	req = req.WithContext(context.WithValue(req.Context(), ctxClaimSet, claim))
-	next(rw, req)
-}
-
-func (a *Authenticator) LogWithSub(rw http.ResponseWriter, req *http.Request, next http.HandlerFunc) {
 	log := zerolog.Ctx(req.Context())
-	claim := ALBOIDCClaimSetFromContext(req.Context())
 	log.UpdateContext(func(c zerolog.Context) zerolog.Context {
 		return c.Str("sub", claim.Sub)
 	})
+
+	req = req.WithContext(context.WithValue(req.Context(), ctxClaimSet, claim))
 	next(rw, req)
 }
 
@@ -239,6 +249,10 @@ func (a *Authenticator) verifyJWT(data string) (ALBOIDCClaimSet, error) {
 	var verified bool
 	var verifyErr error
 	for _, k := range jwkobj.Keys {
+		if k.KeyID != sig.Header.KeyID {
+			continue
+		}
+
 		payload, err := jwsobj.Verify(k)
 		if err == nil {
 			verifiedPayload = payload
@@ -250,7 +264,10 @@ func (a *Authenticator) verifyJWT(data string) (ALBOIDCClaimSet, error) {
 	}
 
 	if !verified {
-		return ALBOIDCClaimSet{}, fmt.Errorf("verifying: %w", verifyErr)
+		if verifyErr != nil {
+			return ALBOIDCClaimSet{}, fmt.Errorf("verifying: %w", verifyErr)
+		}
+		return ALBOIDCClaimSet{}, errors.New("no valid key to verify")
 	}
 
 	claim := ALBOIDCClaimSet{}
@@ -271,7 +288,7 @@ func verifyExp(now time.Time, skew time.Duration, exp int64) bool {
 	return now.Before(skewT)
 }
 
-func NewProxy(signer *Signer) *httputil.ReverseProxy {
+func NewProxy(signer Signer) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			s3Endpoint := S3EndpointFromContext(req.Context())
