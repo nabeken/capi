@@ -8,7 +8,8 @@ publish: zip
 	  --publish
 
 zip: build
-	zip _build/main.zip _build/main
+	@rm -f _build/main.zip
+	zip -j _build/main.zip _build/main
 
 build:
 	GOOS=linux GOARCH=amd64 go build -o _build/main $(CMD)
